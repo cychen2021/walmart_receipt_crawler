@@ -1,7 +1,19 @@
 [project]
 name = "walmart-receipt-crawler"
 version = "0.1.0"
-description = "Add your description here"
+description = "CLI to download Walmart order receipts as PDFs with date filtering"
 readme = "README.md"
-requires-python = ">=3.14"
-dependencies = []
+requires-python = ">=3.10"
+dependencies = [
+	"click>=8.1",
+	"rich>=13.0",
+	"playwright>=1.43",
+	"pypdf>=5.0",
+]
+
+[project.scripts]
+walmart-receipt-crawler = "walmart_receipt_crawler.cli:main"
+
+[build-system]
+requires=["uv_build>=0.9.8,<0.10.0"]
+build-backend = "uv_build"

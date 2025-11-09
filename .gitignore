@@ -293,3 +293,8 @@ dist/
 wheels/
 *.egg-info
 .venv
+
+# Output directory for saved receipts
+receipts/
+
+.playwright/

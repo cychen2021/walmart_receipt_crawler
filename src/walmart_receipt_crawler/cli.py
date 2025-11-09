@@ -81,6 +81,19 @@ def _parse_date(value: Optional[str], default: datetime) -> datetime:
     help="Browser engine/channel to use; 'chrome' may reduce bot checks",
 )
 @click.option(
+    "--use-existing-browser",
+    is_flag=True,
+    default=False,
+    help="Connect to existing browser (launch Edge/Chrome with: msedge --remote-debugging-port=9222)",
+)
+@click.option(
+    "--remote-debugging-port",
+    type=int,
+    default=9222,
+    show_default=True,
+    help="CDP port for connecting to existing browser",
+)
+@click.option(
     "--max",
     "max_count",
     type=int,
@@ -103,6 +116,8 @@ def main(
     headful: bool,
     profile_dir: Path,
     browser: str,
+    use_existing_browser: bool,
+    remote_debugging_port: int,
     max_count: Optional[int],
     timeout: int,
 ) -> None:
@@ -129,6 +144,18 @@ def main(
         )
     )
 
+    if use_existing_browser:
+        console.print(
+            Panel(
+                f"[cyan]Connecting to existing browser on port {remote_debugging_port}...[/cyan]\n\n"
+                f"Make sure you've started Edge/Chrome with:\n"
+                f"[yellow]msedge.exe --remote-debugging-port={remote_debugging_port}[/yellow]\n\n"
+                f"And logged in to Walmart before running this tool.",
+                title="ℹ️  Using Existing Browser",
+                box=box.ROUNDED,
+            )
+        )
+
     combined_path: Optional[Path] = None
     if combined:
         combined_name = f"walmart_receipts_{start.date()}_to_{end.date()}.pdf"
@@ -141,6 +168,8 @@ def main(
             console=console,
             profile_dir=profile_dir,
             browser=browser,
+            use_existing_browser=use_existing_browser,
+            remote_debugging_port=remote_debugging_port,
         ) as crawler:
             with Progress(
                 SpinnerColumn(),

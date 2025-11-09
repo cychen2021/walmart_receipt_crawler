@@ -36,6 +36,8 @@ class WalmartCrawler:
         console: Optional[Console] = None,
         profile_dir: Optional[Path] = None,
         browser: str = "chromium",
+        use_existing_browser: bool = False,
+        remote_debugging_port: int = 9222,
     ):
         self.headless = headless
         self.timeout = timeout * 1000  # playwright ms
@@ -46,48 +48,82 @@ class WalmartCrawler:
         self._page: Optional[Page] = None
         self.profile_dir = profile_dir
         self.browser = browser
+        self.use_existing_browser = use_existing_browser
+        self.remote_debugging_port = remote_debugging_port
 
     def __enter__(self) -> "WalmartCrawler":
         self._playwright = sync_playwright().start()
-        engine = self._playwright.chromium
-        if self.browser.lower() == "chrome":
-            engine = self._playwright.chromium  # playwright uses channel
-        # Use persistent context to reduce logins and lower bot suspicion
-        if self.profile_dir is None:
-            self.profile_dir = Path(".playwright/walmart-profile")
-        self.profile_dir.parent.mkdir(parents=True, exist_ok=True)
-        self._context = engine.launch_persistent_context(
-            user_data_dir=str(self.profile_dir),
-            headless=self.headless,
-            channel="chrome" if self.browser.lower() == "chrome" else None,
-            viewport={"width": 1380, "height": 820},
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        # Set a realistic user agent
-        # Access user agent (optional; may be used for future heuristic decisions)
-        try:
-            _ = self._context.user_agent  # noqa: F841
-        except Exception:
-            pass
-        self._page = self._context.new_page()
-        self._page.set_extra_http_headers(
-            {
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
-        self._page.set_default_timeout(self.timeout)
-        self._apply_stealth(self._page)
+
+        if self.use_existing_browser:
+            # Connect to existing browser via CDP
+            try:
+                self._browser = self._playwright.chromium.connect_over_cdp(
+                    f"http://localhost:{self.remote_debugging_port}"
+                )
+                # Use the first existing context/page or create new one
+                contexts = self._browser.contexts
+                if contexts:
+                    self._context = contexts[0]
+                    pages = self._context.pages
+                    if pages:
+                        self._page = pages[0]
+                    else:
+                        self._page = self._context.new_page()
+                else:
+                    self._context = self._browser.new_context()
+                    self._page = self._context.new_page()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to connect to browser on port {self.remote_debugging_port}. "
+                    f"Make sure browser is running with --remote-debugging-port={self.remote_debugging_port}. "
+                    f"Error: {e}"
+                ) from e
+        else:
+            # Launch new browser with persistent context (original behavior)
+            engine = self._playwright.chromium
+            if self.browser.lower() == "chrome":
+                engine = self._playwright.chromium  # playwright uses channel
+            # Use persistent context to reduce logins and lower bot suspicion
+            if self.profile_dir is None:
+                self.profile_dir = Path(".playwright/walmart-profile")
+            self.profile_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._context = engine.launch_persistent_context(
+                user_data_dir=str(self.profile_dir),
+                headless=self.headless,
+                channel="chrome" if self.browser.lower() == "chrome" else None,
+                viewport={"width": 1380, "height": 820},
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            # Set a realistic user agent
+            # Access user agent (optional; may be used for future heuristic decisions)
+            try:
+                _ = self._context.user_agent  # noqa: F841
+            except Exception:
+                pass
+            self._page = self._context.new_page()
+            self._page.set_extra_http_headers(
+                {
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+            )
+            self._page.set_default_timeout(self.timeout)
+            self._apply_stealth(self._page)
+
         self._page.set_default_timeout(self.timeout)
         return self
 
     def __exit__(self, exc_type, exc, tb):  # noqa: D401
         try:
-            if self._context:
+            # Don't close context if using existing browser (user controls it)
+            if not self.use_existing_browser and self._context:
                 self._context.close()
+            # Disconnect from browser if we connected via CDP
+            if self.use_existing_browser and self._browser:
+                self._browser.close()
         finally:
             if self._playwright:
                 self._playwright.stop()
@@ -95,6 +131,30 @@ class WalmartCrawler:
     # Authentication / navigation helpers -------------------------------------------------
     def ensure_logged_in_and_open_orders(self) -> None:
         page = self._ensure_page()
+
+        # Skip login checks if using existing browser (assume user is already logged in)
+        if self.use_existing_browser:
+            # Just navigate to orders page
+            if "/orders" not in page.url:
+                page.goto(ORDERS_URL)
+                page.wait_for_load_state("domcontentloaded")
+            # Wait for orders content
+            try:
+                self._wait_until(
+                    lambda: len(
+                        page.query_selector_all(
+                            "a[href*='/orders/'][href*='/details/']"
+                        )
+                    )
+                    > 0
+                    or "/orders" in page.url,
+                    timeout_ms=self.timeout * 2,
+                )
+            except Exception:
+                pass
+            return
+
+        # Original login flow for launched browser
         # Try going directly to orders
         page.goto(ORDERS_URL)
         page.wait_for_load_state("domcontentloaded")
@@ -102,11 +162,27 @@ class WalmartCrawler:
         if "/account/login" in page.url:
             if self.console:
                 self.console.print(
-                    "Please log in to Walmart in the opened browser and complete any verification (CAPTCHA/TOTP) if prompted."
+                    "[yellow]Please log in to Walmart in the opened browser and complete any verification (CAPTCHA/TOTP) if prompted.[/yellow]"
                 )
+            # Wait much longer for manual login/CAPTCHA completion (10x timeout, ~7.5 min default)
             self._wait_until(
-                lambda: "/account/login" not in page.url, timeout_ms=self.timeout * 3
+                lambda: "/account/login" not in page.url, timeout_ms=self.timeout * 10
             )
+        # Additional check: if we're on walmart.com but being challenged with CAPTCHA
+        if "walmart.com" in page.url and (
+            "/blocked" in page.url or "robot" in page.content().lower()
+        ):
+            if self.console:
+                from rich.prompt import Prompt
+
+                self.console.print(
+                    "[yellow]⚠️  Bot/CAPTCHA challenge detected. Please complete it in the browser.[/yellow]"
+                )
+                Prompt.ask(
+                    "Press Enter after you've completed the verification", default=""
+                )
+            # Give page time to process after CAPTCHA
+            page.wait_for_timeout(2000)
         # Ensure we land on orders page after login completes
         if "walmart.com" in page.url and "/orders" not in page.url:
             page.goto(ORDERS_URL)
@@ -119,7 +195,7 @@ class WalmartCrawler:
                 )
                 > 0
                 or "/orders" in page.url,
-                timeout_ms=self.timeout,
+                timeout_ms=self.timeout * 2,  # Be more patient for initial load
             )
         except Exception:
             # If not found, continue anyway; user may have no orders in range or page structure changed

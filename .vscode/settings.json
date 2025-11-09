@@ -1,0 +1,11 @@
+{
+    "github.copilot.chat.commitMessageGeneration.instructions": [
+        {
+            "file": "copilot-instructions/commit/commit-general.instructions.md"
+        }
+    ],
+    "chat.instructionsFilesLocations": {
+        ".github/instructions": true,
+        "copilot-instructions/codegen": true
+    }
+}

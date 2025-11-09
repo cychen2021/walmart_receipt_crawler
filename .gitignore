@@ -298,3 +298,4 @@ wheels/
 receipts/
 
 .playwright/
+debug_dumps

@@ -82,6 +82,7 @@ uv run walmart-receipt-crawler --help
 - If using `--use-existing-browser` and you see no receipts, scroll manually in the Orders page first (virtualized lists may need user interaction).
 - If you encounter repeated bot challenges, prefer the existing-browser mode.
 - Be mindful of rate limits and do not abuse the service.
+- Some Walmart order detail pages (notably **Store purchase** entries) 404 unless required query parameters are present. The crawler now probes variants like `?groupId=0&storePurchase=true` automatically; if you manually open an order and see the URL contains `groupId` or `storePurchase` flags, that is expected.
 
 ## License
 

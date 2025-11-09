@@ -107,6 +107,12 @@ def _parse_date(value: Optional[str], default: datetime) -> datetime:
     show_default=True,
     help="Navigation timeout in seconds",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    default=False,
+    help="Enable debug dumps (HTML, screenshot, receipt extraction logs)",
+)
 @click.version_option()
 def main(
     start_str: Optional[str],
@@ -120,6 +126,7 @@ def main(
     remote_debugging_port: int,
     max_count: Optional[int],
     timeout: int,
+    debug: bool,
 ) -> None:
     """Crawl Walmart order receipts and export to PDF.
 
@@ -170,6 +177,7 @@ def main(
             browser=browser,
             use_existing_browser=use_existing_browser,
             remote_debugging_port=remote_debugging_port,
+            debug=debug,
         ) as crawler:
             with Progress(
                 SpinnerColumn(),

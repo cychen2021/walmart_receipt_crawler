@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
+import re
+from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -23,9 +25,60 @@ ORDERS_URL = "https://www.walmart.com/orders"
 @dataclass
 class Receipt:
     order_id: str
-    order_date: datetime
-    detail_url: str
-    pdf_filename: str
+    order_date: Optional[datetime] = None
+    detail_url: Optional[str] = None
+    pdf_filename: Optional[str] = None
+    # optional metadata to build correct detail URL
+    group_id: Optional[int] = None
+    store_purchase: Optional[bool] = None
+
+    def __or__(self, other: Receipt) -> Receipt:
+        if self.order_id != other.order_id:
+            return other
+        new_id = self.order_id
+        match (self.order_date, other.order_date):
+            case (None, None):
+                new_date = None
+            case (dt, None) | (None, dt):
+                new_date = dt
+            case (dt1, dt2):
+                new_date = dt2
+        match (self.detail_url, other.detail_url):
+            case (None, None):
+                new_url = None
+            case (url, None) | (None, url):
+                new_url = url
+            case (url1, url2):
+                new_url = url2
+        match (self.pdf_filename, other.pdf_filename):
+            case (None, None):
+                new_pdf = None
+            case (pdf, None) | (None, pdf):
+                new_pdf = pdf
+            case (pdf1, pdf2):
+                new_pdf = pdf2
+        match (self.group_id, other.group_id):
+            case (None, None):
+                new_group = None
+            case (gid, None) | (None, gid):
+                new_group = gid
+            case (gid1, gid2):
+                new_group = gid2
+        match (self.store_purchase, other.store_purchase):
+            case (None, None):
+                new_store = None
+            case (sp, None) | (None, sp):
+                new_store = sp
+            case (sp1, sp2):
+                new_store = sp1 or sp2
+        return Receipt(
+            order_id=new_id,
+            order_date=new_date,
+            detail_url=new_url,
+            pdf_filename=new_pdf,
+            group_id=new_group,
+            store_purchase=new_store,
+        )
 
 
 class WalmartCrawler:
@@ -38,6 +91,7 @@ class WalmartCrawler:
         browser: str = "chromium",
         use_existing_browser: bool = False,
         remote_debugging_port: int = 9222,
+        debug: bool = False,
     ):
         self.headless = headless
         self.timeout = timeout * 1000  # playwright ms
@@ -50,6 +104,10 @@ class WalmartCrawler:
         self.browser = browser
         self.use_existing_browser = use_existing_browser
         self.remote_debugging_port = remote_debugging_port
+        self.debug = debug
+        self.debug_dir = Path("debug_dumps") if debug else None
+        if self.debug_dir:
+            self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     def __enter__(self) -> "WalmartCrawler":
         self._playwright = sync_playwright().start()
@@ -217,38 +275,101 @@ class WalmartCrawler:
         # Walmart order list items could have data attributes or accessible links.
         # We add fallback selectors; actual site may require adjustments.
 
-        def parse_order_elements():
-            elements = page.query_selector_all("a[href*='/orders/'][href*='/details/']")
-            for el in elements:
-                href = el.get_attribute("href")
-                if not href:
-                    continue
-                order_id = href.split("/")[-1]
-                # Attempt to derive date from sibling element
-                parent = el.evaluate_handle("(e) => e.closest('div')")
-                date_text = None
+        # Second attempt: new structure with buttons (data-automation-id="view-order-details-link-<orderId>")
+        def parse_order_containers():
+            if receipts:  # Skip if we already collected using anchors
+                return
+            containers = page.query_selector_all("div[data-testid^='order-']")
+            collected: dict[str, Receipt] = {}
+            for c in containers:
                 try:
-                    date_el = parent.query_selector("time") if parent else None
-                    if date_el:
-                        date_text = date_el.inner_text()
+                    # Order ID from view details button or start-return link
+                    btn = c.query_selector(
+                        "button[data-automation-id^='view-order-details-link-']"
+                    )
+                    order_id = None
+                    if btn:
+                        attr = btn.get_attribute("data-automation-id") or ""
+                        if attr.startswith("view-order-details-link-"):
+                            order_id = attr.split("view-order-details-link-")[-1]
+                    if not order_id:
+                        ret_link = c.query_selector(
+                            "a[data-automation-id^='start-return-link-']"
+                        )
+                        if ret_link:
+                            attr = ret_link.get_attribute("data-automation-id") or ""
+                            if attr.startswith("start-return-link-"):
+                                order_id = attr.split("start-return-link-")[-1]
+                    if not order_id:
+                        continue
+                    # Date from header text (h2) e.g. "Nov 08, 2025 purchase" or embedded in aria-label
+                    h2 = c.query_selector("h2")
+                    date_text = h2.inner_text() if h2 else None
+                    if date_text:
+                        # Extract canonical date substring
+                        m = re.search(
+                            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2},\s+\d{4}",
+                            date_text,
+                        )
+                        date_sub = m.group(0) if m else date_text
+                    else:
+                        # Fallback: try aria-label on button
+                        date_sub = None
+                        if btn:
+                            aria = btn.get_attribute("aria-label") or ""
+                            m = re.search(
+                                r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2},\s+\d{4}",
+                                aria,
+                            )
+                            date_sub = m.group(0) if m else None
+                    order_date = self._parse_order_date(date_sub) if date_sub else None
+                    if not order_date:
+                        continue
+                    if order_date < start or order_date > end:
+                        continue
+                    group_id = 0  # heuristic default for single-group orders
+                    # Find the text `Store purchase` within `c`
+                    all_text = c.inner_text()
+                    store_purchase = "Store purchase" in all_text
+                    if order_id in collected:
+                        collected[order_id] = collected[order_id] | Receipt(
+                            order_id=order_id,
+                            order_date=order_date,
+                            detail_url=None,
+                            pdf_filename=f"walmart_{order_date.date()}_{order_id}.pdf",
+                            group_id=group_id,
+                            store_purchase=store_purchase,
+                        )
+                    else:
+                        collected[order_id] = Receipt(
+                            order_id=order_id,
+                            order_date=order_date,
+                            detail_url=None,
+                            pdf_filename=f"walmart_{order_date.date()}_{order_id}.pdf",
+                            group_id=group_id,
+                            store_purchase=store_purchase,
+                        )
+                except Exception:
+                    continue
+            for r in collected.values():
+                if r.store_purchase:
+                    detail_url = f"https://www.walmart.com/orders/{r.order_id}?groupId={r.group_id}&storePurchase=true"
+                else:
+                    detail_url = f"https://www.walmart.com/orders/{r.order_id}"
+                r.detail_url = detail_url
+                receipts.append(r)
+            if self.debug:
+                try:
+                    (self.debug_dir / "parse_log.txt").open(
+                        "a", encoding="utf-8"
+                    ).write(
+                        f"Parsed {len(containers)} order containers, collected {len(receipts)} receipts via containers\n"
+                    )
                 except Exception:
                     pass
-                order_date = self._parse_order_date(date_text) if date_text else None
-                if order_date is None:
-                    # if no date, skip — could extend by opening page
-                    continue
-                if order_date < start or order_date > end:
-                    continue
-                receipts.append(
-                    Receipt(
-                        order_id=order_id,
-                        order_date=order_date,
-                        detail_url=f"https://www.walmart.com{href}",
-                        pdf_filename=f"walmart_{order_date.date()}_{order_id}.pdf",
-                    )
-                )
 
-        parse_order_elements()
+        parse_order_containers()
+
         # Basic scrolling to load more orders (if virtualization)
         prev_len = -1
         while (max_count is None or len(receipts) < max_count) and len(
@@ -259,9 +380,45 @@ class WalmartCrawler:
             # Random delay between 3-6 seconds - humans need time to scan/read orders
             delay_ms = random.randint(3000, 6000)
             page.wait_for_timeout(delay_ms)
-            parse_order_elements()
+            parse_order_containers()
             if max_count and len(receipts) >= max_count:
                 break
+        # Dedupe receipts by order_id
+        if receipts:
+            unique = {}
+            for r in receipts:
+                unique[r.order_id] = r
+            receipts = list(unique.values())
+
+        # Debug artifacts
+        if self.debug:
+            try:
+                if not receipts:
+                    (self.debug_dir / "orders_page.html").write_text(
+                        page.content(), encoding="utf-8"
+                    )
+                    page.screenshot(
+                        path=str(self.debug_dir / "orders_page.png"), full_page=True
+                    )
+                # Always record structured state JSON for inspection
+                import json
+
+                state_path = self.debug_dir / "orders_state.json"
+                state = [
+                    {
+                        "order_id": r.order_id,
+                        "order_date": r.order_date.isoformat(),
+                        "detail_url": r.detail_url,
+                        "pdf_filename": r.pdf_filename,
+                        "order_type": r.order_type,
+                        "group_id": r.group_id,
+                        "store_purchase": r.store_purchase,
+                    }
+                    for r in receipts
+                ]
+                state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
         if max_count:
             receipts = receipts[:max_count]
@@ -270,11 +427,84 @@ class WalmartCrawler:
     # Receipt PDF -------------------------------------------------------------------------
     def save_receipt_pdf(self, receipt: Receipt, out_dir: Path) -> Path:
         page = self._ensure_page()
-        page.goto(receipt.detail_url)
-        page.wait_for_load_state("networkidle")
         pdf_path = out_dir / receipt.pdf_filename
-        # Render full page PDF; could refine to receipt container only.
-        page.pdf(path=str(pdf_path), format="A4")
+        # Probe candidate detail URLs, preserving required query params
+        base = f"https://www.walmart.com/orders/{receipt.order_id}"
+        group_id = receipt.group_id if receipt.group_id is not None else 0
+        parsed = urlparse(receipt.detail_url) if receipt.detail_url else None
+        existing_qs = f"?{parsed.query}" if parsed and parsed.query else ""
+        is_store = bool(
+            (receipt.store_purchase is True)
+            or (parsed and "storePurchase=true" in (parsed.query or ""))
+        )
+        candidates = []
+        # Always try the provided detail_url first (preserves all args exactly)
+        if receipt.detail_url:
+            candidates.append(receipt.detail_url)
+        # Derive a /details variant but keep the same query string if any
+        if existing_qs:
+            candidates.append(f"{base}/details{existing_qs}")
+        else:
+            # If no query yet, build one based on heuristics
+            if is_store:
+                candidates.append(f"{base}?groupId={group_id}&storePurchase=true")
+                candidates.append(
+                    f"{base}/details?groupId={group_id}&storePurchase=true"
+                )
+            else:
+                candidates.append(f"{base}?groupId={group_id}")
+                candidates.append(f"{base}/details?groupId={group_id}")
+        success = False
+        for url in candidates:
+            try:
+                page.goto(url)
+                page.wait_for_load_state("domcontentloaded")
+                # Heuristic: presence of return link or print word indicates details page
+                has_return_link = bool(
+                    page.query_selector(
+                        f"a[href*='/orders/{receipt.order_id}/returns']"
+                    )
+                )
+                content_lower = page.content().lower()
+                has_print_word = "print" in content_lower and "receipt" in content_lower
+                if has_return_link or has_print_word:
+                    receipt.detail_url = url  # update with confirmed working URL
+                    success = True
+                    break
+            except Exception:
+                continue
+        if not success:
+            # As a robust fallback, return to orders list and click the button for this order id
+            try:
+                page.goto(ORDERS_URL)
+                page.wait_for_load_state("domcontentloaded")
+                btn = page.query_selector(
+                    f"button[data-automation-id='view-order-details-link-{receipt.order_id}']"
+                )
+                if btn:
+                    btn.click()
+                    page.wait_for_load_state("domcontentloaded")
+                    # Preserve the final URL including its query params
+                    try:
+                        receipt.detail_url = page.url
+                    except Exception:
+                        pass
+                    success = True
+            except Exception:
+                pass
+        try:
+            page.pdf(path=str(pdf_path), format="A4")
+        except Exception as e:
+            if self.debug:
+                try:
+                    (self.debug_dir / "parse_log.txt").open(
+                        "a", encoding="utf-8"
+                    ).write(
+                        f"Failed to generate PDF for order {receipt.order_id} (last URL: {page.url}): {e}\n"
+                    )
+                except Exception:
+                    pass
+            raise
         # Add delay before next PDF request - humans would review each order (5-10 sec)
         delay_ms = random.randint(5000, 10000)
         page.wait_for_timeout(delay_ms)

@@ -10,15 +10,6 @@ CLI utility to log in to your Walmart account (manually in a real browser) and e
 - Headful browser by default (recommended to pass bot checks)
 - Persistent browser profile to keep your session
 
-## Installation
-
-Use `uv` to manage dependencies:
-
-```sh
-uv add click rich playwright pypdf
-playwright install chromium
-```
-
 ## Usage
 
 ### Standard (launch new browser)

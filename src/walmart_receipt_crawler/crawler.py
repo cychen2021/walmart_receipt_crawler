@@ -31,6 +31,7 @@ class Receipt:
     # optional metadata to build correct detail URL
     group_id: Optional[int] = None
     store_purchase: Optional[bool] = None
+    order_type: str = "online"  # "store", "pickup", or "online"
 
     def __or__(self, other: Receipt) -> Receipt:
         if self.order_id != other.order_id:
@@ -71,6 +72,11 @@ class Receipt:
                 new_store = sp
             case (sp1, sp2):
                 new_store = sp1 or sp2
+        match (self.order_type, other.order_type):
+            case ("online", ot) | (ot, "online"):
+                new_type = ot
+            case (ot1, ot2):
+                new_type = ot2
         return Receipt(
             order_id=new_id,
             order_date=new_date,
@@ -78,6 +84,7 @@ class Receipt:
             pdf_filename=new_pdf,
             group_id=new_group,
             store_purchase=new_store,
+            order_type=new_type,
         )
 
 
@@ -312,20 +319,46 @@ class WalmartCrawler:
                         date_sub = None
                         if btn:
                             aria = btn.get_attribute("aria-label") or ""
+                            # First try full date with year
                             m = re.search(
                                 r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2},\s+\d{4}",
                                 aria,
                             )
-                            date_sub = m.group(0) if m else None
+                            if m:
+                                date_sub = m.group(0)
+                            else:
+                                # Try date without year (e.g., "Nov 05" in aria-labels)
+                                # Assume current year if not specified
+                                m = re.search(
+                                    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{2}",
+                                    aria,
+                                )
+                                if m:
+                                    # Append current year
+                                    current_year = datetime.now().year
+                                    date_sub = f"{m.group(0)}, {current_year}"
                     order_date = self._parse_order_date(date_sub) if date_sub else None
                     if not order_date:
                         continue
                     if order_date < start or order_date > end:
                         continue
                     group_id = 0  # heuristic default for single-group orders
-                    # Find the text `Store purchase` within `c`
+                    # Determine order type from text content
+                    # Check in priority order: curbside (most specific) > store > online
                     all_text = c.inner_text()
+                    is_curbside = "Curbside" in all_text or "curbside" in all_text
                     store_purchase = "Store purchase" in all_text
+
+                    # Determine order type
+                    if is_curbside:
+                        order_type = "pickup"
+                        store_purchase = (
+                            False  # Override, it's not actually a store purchase
+                        )
+                    elif store_purchase:
+                        order_type = "store"
+                    else:
+                        order_type = "online"
                     if order_id in collected:
                         collected[order_id] = collected[order_id] | Receipt(
                             order_id=order_id,
@@ -334,6 +367,7 @@ class WalmartCrawler:
                             pdf_filename=f"walmart_{order_date.date()}_{order_id}.pdf",
                             group_id=group_id,
                             store_purchase=store_purchase,
+                            order_type=order_type,
                         )
                     else:
                         collected[order_id] = Receipt(
@@ -343,13 +377,18 @@ class WalmartCrawler:
                             pdf_filename=f"walmart_{order_date.date()}_{order_id}.pdf",
                             group_id=group_id,
                             store_purchase=store_purchase,
+                            order_type=order_type,
                         )
                 except Exception:
                     continue
             for r in collected.values():
-                if r.store_purchase:
+                # Construct appropriate detail URL based on order type
+                if r.order_type == "store":
                     detail_url = f"https://www.walmart.com/orders/{r.order_id}?groupId={r.group_id}&storePurchase=true"
-                else:
+                elif r.order_type == "pickup":
+                    # Pickup orders use the same base URL as online orders but may have different details page
+                    detail_url = f"https://www.walmart.com/orders/{r.order_id}?groupId={r.group_id}"
+                else:  # online
                     detail_url = f"https://www.walmart.com/orders/{r.order_id}"
                 r.detail_url = detail_url
                 receipts.append(r)
@@ -411,6 +450,7 @@ class WalmartCrawler:
                         "pdf_filename": r.pdf_filename,
                         "group_id": r.group_id,
                         "store_purchase": r.store_purchase,
+                        "order_type": r.order_type,
                     }
                     for r in receipts
                 ]
@@ -451,8 +491,12 @@ class WalmartCrawler:
                     f"{base}/details?groupId={group_id}&storePurchase=true"
                 )
             else:
+                # Try variants for pickup and online orders
                 candidates.append(f"{base}?groupId={group_id}")
                 candidates.append(f"{base}/details?groupId={group_id}")
+                # Also try without groupId for pickup orders
+                candidates.append(f"{base}/details")
+                candidates.append(base)
         success = False
         for url in candidates:
             try:

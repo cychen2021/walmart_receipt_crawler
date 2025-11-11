@@ -222,6 +222,7 @@ def main(
                     progress.advance(task)
 
             if combined and saved_paths:
+                assert combined_path is not None  # combined=True guarantees this
                 merge_pdfs(saved_paths, combined_path)
                 console.print(
                     Panel(

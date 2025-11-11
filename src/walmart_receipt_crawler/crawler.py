@@ -157,11 +157,6 @@ class WalmartCrawler:
                 ],
             )
             # Set a realistic user agent
-            # Access user agent (optional; may be used for future heuristic decisions)
-            try:
-                _ = self._context.user_agent  # noqa: F841
-            except Exception:
-                pass
             self._page = self._context.new_page()
             self._page.set_extra_http_headers(
                 {
@@ -360,6 +355,7 @@ class WalmartCrawler:
                 receipts.append(r)
             if self.debug:
                 try:
+                    assert self.debug_dir is not None
                     (self.debug_dir / "parse_log.txt").open(
                         "a", encoding="utf-8"
                     ).write(
@@ -393,6 +389,7 @@ class WalmartCrawler:
         # Debug artifacts
         if self.debug:
             try:
+                assert self.debug_dir is not None
                 if not receipts:
                     (self.debug_dir / "orders_page.html").write_text(
                         page.content(), encoding="utf-8"
@@ -407,10 +404,11 @@ class WalmartCrawler:
                 state = [
                     {
                         "order_id": r.order_id,
-                        "order_date": r.order_date.isoformat(),
+                        "order_date": r.order_date.isoformat()
+                        if r.order_date
+                        else None,
                         "detail_url": r.detail_url,
                         "pdf_filename": r.pdf_filename,
-                        "order_type": r.order_type,
                         "group_id": r.group_id,
                         "store_purchase": r.store_purchase,
                     }
@@ -427,6 +425,7 @@ class WalmartCrawler:
     # Receipt PDF -------------------------------------------------------------------------
     def save_receipt_pdf(self, receipt: Receipt, out_dir: Path) -> Path:
         page = self._ensure_page()
+        assert receipt.pdf_filename is not None
         pdf_path = out_dir / receipt.pdf_filename
         # Probe candidate detail URLs, preserving required query params
         base = f"https://www.walmart.com/orders/{receipt.order_id}"
@@ -497,6 +496,7 @@ class WalmartCrawler:
         except Exception as e:
             if self.debug:
                 try:
+                    assert self.debug_dir is not None
                     (self.debug_dir / "parse_log.txt").open(
                         "a", encoding="utf-8"
                     ).write(
